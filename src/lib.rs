@@ -3,7 +3,7 @@ use std::{
     fmt,
     io::{prelude::*, BufReader},
     net::{TcpListener, TcpStream},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use strum::EnumProperty;
@@ -146,16 +146,17 @@ impl<T: 'static> CallbackPathManager<T> {
 pub struct WebService<'a, T: 'static> {
     addr: &'a str,
     path_manager: CallbackPathManager<T>,
-    shared_data: Arc<T>,
+    shared_data: Arc<Mutex<T>>,
 }
 
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct Request<'a, T: 'static> {
-    pub shared_data: Arc<T>,
+    pub shared_data: Arc<Mutex<T>>,
     pub params: HashMap<String, String>,
     pub args: HashMap<String, String>,
     pub stream: &'a TcpStream,
+    pub body: Vec<u8>,
 }
 
 impl<'a, T: Send + Sync> WebService<'a, T> {
@@ -163,7 +164,7 @@ impl<'a, T: Send + Sync> WebService<'a, T> {
         Self {
             addr,
             path_manager: CallbackPathManager::<T>::new(),
-            shared_data: Arc::new(shared_data),
+            shared_data: Arc::new(Mutex::new(shared_data)),
         }
     }
 
@@ -178,33 +179,42 @@ impl<'a, T: Send + Sync> WebService<'a, T> {
     }
 
     fn handle_connection(&mut self, mut stream: TcpStream) {
-        let buf_reader = BufReader::new(&stream);
-        let http_request: Vec<_> = buf_reader
-            .lines()
-            .map(|result| result.unwrap())
-            .take_while(|line| !line.is_empty())
-            .collect();
+        let mut headers = [httparse::EMPTY_HEADER; 64];
+        let mut req = httparse::Request::new(&mut headers);
+        let mut data = vec![]; 
+        loop {
+            let mut buffer = [0; 2048];
+            if let Ok(n) = stream.read(&mut buffer) {
+                data.extend_from_slice(&buffer[..n]);
 
-        if http_request.first().is_none() {
-            stream
-                .write_all("HTTP/1.1 400 BAD REQUEST".as_bytes())
-                .unwrap();
+                if n == 2048 {
+                    continue;
+                }
+            }
+
+            break;
+        }
+
+        req.parse(&data).unwrap();
+
+        if req.method.is_none() || req.path.is_none() || req.headers.is_empty() {
+            let _ = stream.write_all("HTTP/1.1 500 INTERNAL SERVER ERROR".as_bytes());
             return;
         }
 
-        println!("{} from {}", http_request[0], stream.peer_addr().unwrap());
+        // Extract body
+        let body_start = data.windows(4).position(|window| window == b"\r\n\r\n");
+        let body = if let Some(body_start) = body_start {
+            data[body_start + 4..].to_vec()
+        } else {
+            vec![]
+        };
 
-        let http_request = http_request[0].split(' ').collect::<Vec<_>>();
-        if http_request.len() != 3 {
-            stream
-                .write_all("HTTP/1.1 400 BAD REQUEST".as_bytes())
-                .unwrap();
-            return;
-        }
 
-        let method = http_request[0].to_owned().parse().unwrap_or(Method::GET);
-        let path_and_args = http_request.get(1).unwrap_or(&"/");
-        let mut path = *path_and_args;
+        // TODO: https://lib.rs/crates/httparse
+        let method = req.method.unwrap().parse().unwrap_or(Method::GET);
+        let path_and_args = req.path.unwrap_or(&"/");
+        let mut path = path_and_args;
         let mut args = HashMap::new();
 
         // Extract params
@@ -239,6 +249,7 @@ impl<'a, T: Send + Sync> WebService<'a, T> {
                     args,
                     params,
                     stream: &stream,
+                    body,
                 });
 
                 let _ = if let Some(content_type) = response.get_str("content_type") {
@@ -280,8 +291,7 @@ impl<'a, T: Send + Sync> WebService<'a, T> {
 
         println!("Listening on {}", url);
 
-        for stream in listener.incoming() {
-            let stream = stream.unwrap();
+        while let Ok((stream, _socket)) = listener.accept() {
             self.handle_connection(stream);
         }
     }
